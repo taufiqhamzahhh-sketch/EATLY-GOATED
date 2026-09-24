@@ -1,5 +1,6 @@
 import BottomSheet, {
   BottomSheetBackdrop,
+  BottomSheetFooter,
   BottomSheetScrollView,
   BottomSheetTextInput,
 } from "@gorhom/bottom-sheet";
@@ -88,7 +89,7 @@ function CustomizeSheetInner({
     });
   };
 
-  const handleAdd = () => {
+  const handleAdd = useCallback(() => {
     const selected: SelectedOption[] = [];
     item.options.forEach((g) => {
       if (g.type === "single") {
@@ -117,13 +118,36 @@ function CustomizeSheetInner({
     });
     show(`${qty}× ${item.name} ditambahkan`, "success");
     onClose();
-  };
+  }, [item, restaurantId, restaurantName, unitPrice, qty, notes, singles, multis, addItem, show, onClose]);
 
   const backdrop = useCallback(
     (bprops: any) => (
       <BottomSheetBackdrop {...bprops} appearsOnIndex={0} disappearsOnIndex={-1} pressBehavior="close" />
     ),
     [],
+  );
+
+  const renderFooter = useCallback(
+    (fprops: any) => (
+      <BottomSheetFooter {...fprops} bottomInset={0}>
+        <View style={[styles.footer, { paddingBottom: insets.bottom + spacing.md }]}>
+          <Stepper
+            value={qty}
+            onIncrement={() => setQty((q) => q + 1)}
+            onDecrement={() => setQty((q) => Math.max(1, q - 1))}
+          />
+          <Pressable
+            testID="customize-add-to-cart"
+            onPress={handleAdd}
+            style={({ pressed }) => [styles.addBtn, pressed && styles.pressed]}
+          >
+            <Text style={styles.addBtnText}>Tambah ke Keranjang</Text>
+            <Text style={styles.addBtnPrice}>{formatRupiah(unitPrice * qty)}</Text>
+          </Pressable>
+        </View>
+      </BottomSheetFooter>
+    ),
+    [qty, unitPrice, handleAdd, insets.bottom, styles],
   );
 
   return (
@@ -137,6 +161,7 @@ function CustomizeSheetInner({
       android_keyboardInputMode="adjustResize"
       handleIndicatorStyle={styles.handle}
       backgroundStyle={styles.sheetBg}
+      footerComponent={renderFooter}
     >
       <BottomSheetScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <Image source={{ uri: item.image }} style={styles.image} contentFit="cover" />
@@ -200,14 +225,6 @@ function CustomizeSheetInner({
           />
         </View>
       </BottomSheetScrollView>
-
-      <View style={[styles.footer, { paddingBottom: insets.bottom + spacing.md }]}>
-        <Stepper value={qty} onIncrement={() => setQty((q) => q + 1)} onDecrement={() => setQty((q) => Math.max(1, q - 1))} />
-        <Pressable testID="customize-add-to-cart" onPress={handleAdd} style={({ pressed }) => [styles.addBtn, pressed && styles.pressed]}>
-          <Text style={styles.addBtnText}>Tambah ke Keranjang</Text>
-          <Text style={styles.addBtnPrice}>{formatRupiah(unitPrice * qty)}</Text>
-        </Pressable>
-      </View>
     </BottomSheet>
   );
 }
@@ -224,7 +241,7 @@ function NotesInput(props: React.ComponentProps<typeof TextInput>) {
 const useStyles = makeStyles((colors) => ({
   sheetBg: { backgroundColor: colors.surfaceSecondary, borderTopLeftRadius: radius.xl, borderTopRightRadius: radius.xl },
   handle: { backgroundColor: colors.borderStrong, width: 44 },
-  content: { paddingHorizontal: spacing.lg, paddingTop: spacing.sm, paddingBottom: 130, gap: spacing.xs },
+  content: { paddingHorizontal: spacing.lg, paddingTop: spacing.sm, paddingBottom: 120, gap: spacing.xs },
   image: { width: "100%", height: 190, borderRadius: radius.lg, backgroundColor: colors.surfaceTertiary, marginBottom: spacing.md },
   name: { fontFamily: fonts.extrabold, fontSize: 20, color: colors.onSurface },
   desc: { fontFamily: fonts.regular, fontSize: 13.5, color: colors.muted, lineHeight: 19, marginTop: 4 },
@@ -260,10 +277,6 @@ const useStyles = makeStyles((colors) => ({
     textAlignVertical: "top",
   },
   footer: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    bottom: 0,
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.md,

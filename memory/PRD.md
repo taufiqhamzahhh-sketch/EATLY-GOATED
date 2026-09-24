@@ -1,46 +1,40 @@
-# EATLY — Product Requirements & Progress
+# EATLY — Product Requirements Document
 
-## Original Problem Statement
-Build EATLY, a production-ready food discovery + dine-in pre-order platform. Two experiences: Diner (mobile-first) and Merchant (desktop-first, later). Core diner flow: Discover → View restaurant → Explore menu → Customize → Add to cart → Dine-in info → Checkout → Payment → Order confirmation → QR verification → Order tracking → Complete → Review. Design source of truth = provided Eatly screenshots (orange brand, warm cream bg, white cards, dark navy text, rounded cards, soft borders, status badges green/yellow/red). Build systematically phase by phase, no fake functionality.
-
-## User Choices
-- Build Diner mobile app first (Merchant later).
-- Auth: Email + password (custom JWT).
-- Payment: Mock/simulated for now (structured to swap for real later).
-- Language: Bahasa Indonesia. Currency: Rupiah.
-- Phase 1 scope: Foundation + Auth + Discovery/list + full menu browse & customize + Cart.
+## Problem Statement
+Aplikasi pemesanan makan di tempat (dine-in) berbahasa Indonesia. User memberikan repo GitHub + self-extractor berisi kode EATLY versi lengkap (Phase 2/3), yang diimpor ke workspace ini untuk dilanjutkan pengembangannya.
 
 ## Architecture
-- Backend: FastAPI + MongoDB (motor). JWT auth (bcrypt + PyJWT). `/api` prefix. Models: User, Restaurant, MenuItem (with option groups), Reel, Favorite. Seed data on startup (6 restaurants, menus with options, 3 reels, demo user).
-- Frontend: Expo Router (file-based), React Query for server data, custom AuthContext + CartContext + ToastContext. Theme tokens in src/theme.ts (light+dark). Plus Jakarta Sans via expo-font. Ionicons via @react-native-vector-icons. Bottom sheet via @gorhom/bottom-sheet. Cart persisted locally (single-restaurant scoped) — real orders move server-side in Phase 2.
+- Frontend: Expo / React Native (expo-router), React Query + Context, Plus Jakarta Sans.
+- Backend: FastAPI + Motor (MongoDB), JWT auth, bcrypt.
+- Env: MONGO_URL, DB_NAME (eatly_database), JWT_SECRET di backend/.env; EXPO_PUBLIC_BACKEND_URL di frontend/.env.
+- Data auto-seed saat startup (6 restoran, 17 menu, 3 reels, user demo).
 
 ## User Personas
-- Diner (customer) browsing restaurants and pre-ordering for dine-in.
-- (Later) Merchant managing restaurant + orders.
+- Diner (pelanggan) yang ingin memesan makanan untuk makan di tempat, memilih meja & waktu, membayar (simulasi), melacak pesanan, dan memberi ulasan.
 
-## Implemented (2026-06 / Phase 1) — DONE & tested
-- Email/password auth: register, login (demo andi@eatly.com/password123), JWT, session bootstrap, logout. (16/16 backend tests pass)
-- Beranda/Discovery: food reels ("Lagi Viral"), Pilihan Komunitas + Jelajahi Semua lists, live search, loading/empty/error states, pull-to-refresh.
-- Restaurant Detail: full-bleed hero + overlapping info card, HALAL/Buka pills, rating, chips, info row (estimasi/jarak/kapasitas), sticky Menu/Ulasan/Info tabs, menu grouped by category.
-- Menu item Customize bottom sheet: single (radio) + multi (checkbox) options with price deltas, required badges, kitchen notes, qty stepper, live total, add-to-cart. (web TextInput crash fixed via platform split)
-- Floating orange cart bar + Cart screen: line items with option/notes summary, steppers, remove, subtotal.
-- Favorites: toggle on detail, Favorit tab list, count reflected in profile.
-- Profil: orange header, stats, dark referral card (copy + WhatsApp share), menu rows, logout.
-- 4-tab bottom nav (Beranda, Pesanan, Favorit, Profil); Pesanan is an intentional empty state until Phase 2.
+## Core Requirements (static)
+- Auth email/password (JWT).
+- Discovery: beranda, reels komunitas, pencarian, detail restoran + menu per kategori, ulasan, info.
+- Kustomisasi menu (level pedas, pilihan nasi, tambahan) via bottom sheet.
+- Keranjang, checkout dine-in, pembayaran simulasi (QRIS/GoPay/Card/Cash), promo tervalidasi server.
+- Pelacakan pesanan (paid → preparing → ready → completed) + pembatalan (window 5 detik).
+- Ulasan (hanya order selesai), notifikasi in-app.
+- Favorit, profil dengan kode referral.
+
+## Implemented (with dates)
+- 2026-09-24: Impor proyek lengkap dari self-extractor. Buat ulang .env yang hilang. Backend 21 endpoint aktif.
+  - Auth, restaurants, menu, reels, favorites.
+  - Orders (validasi harga & opsi server-side, promo, metode bayar), status progression otomatis (background loop 5s), cancel/complete.
+  - Reviews (+ agregasi rating restoran), Notifications (list, unread-count, read-all).
+  - Frontend screens: checkout, payment-success (QR), order/[id] tracking, review/[id], notifications, +not-found.
+  - Verified: testing agent — backend 29/29 pass, frontend E2E 100%.
 
 ## Backlog / Remaining
-### P0 (next phase)
-- Checkout / "Ringkasan & Bayar": dine-in table + time selection, promo code, payment method (QRIS mock), order totals.
-- Mock Payment + Order creation (server-side Order model, statuses created→paid→preparing→ready→completed/cancelled).
-- Order confirmation with QR + order ID; Order tracking; Pesanan tab shows real orders.
-- Review restaurant after completed order (populates Ulasan tab).
-### P1
-- Merchant/Restaurant dashboard (desktop-first).
-- Real reviews list on Ulasan tab; ratings write-back.
-### P2
-- Push notifications (only on request; needs build), promos/loyalty, address/location picker.
+- P1: Layar Search & Community terdedikasi; halaman Info restoran yang lebih kaya.
+- P1: Aplikasi merchant (desktop) — kelola menu, pesanan masuk, status meja.
+- P2: Pembayaran asli (Stripe/Razorpay) menggantikan mock; promo/referral engine.
+- P2: Upload gambar (Object Storage) untuk avatar/menu; realtime tracking (websocket).
+- P2: Autentikasi hardening, forgot-password.
 
-## Next Tasks
-1. Phase 2: Checkout → mock payment → order confirmation (QR) → tracking → Pesanan tab wiring.
-2. Phase 3: Reviews + Ulasan tab.
-3. Phase 4: Merchant dashboard.
+## Demo Credentials
+- andi@eatly.com / password123

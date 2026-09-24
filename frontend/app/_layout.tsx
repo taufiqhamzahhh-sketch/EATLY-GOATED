@@ -53,6 +53,8 @@ export default function RootLayout() {
                         <Stack.Screen name="checkout" />
                         <Stack.Screen name="payment-success" options={{ gestureEnabled: false }} />
                         <Stack.Screen name="order/[id]" />
+                        <Stack.Screen name="review/[id]" />
+                        <Stack.Screen name="notifications" />
                       </Stack>
                     </ToastProvider>
                   </OrdersProvider>

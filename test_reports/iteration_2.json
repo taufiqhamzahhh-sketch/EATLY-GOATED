@@ -1,0 +1,43 @@
+{
+  "summary": "EATLY Phase 2/3 regression. Backend pytest: 29/29 PASS (auth, restaurants, menu, reels, favorites, orders w/ server-side price validation + promos NEWFAM/EATLY25/HEMAT10, required option enforcement, invalid payment method, cancel window 5s, complete-only-when-ready, auto progression paid->preparing(10s)->ready(25s), reviews rating/count aggregation + duplicate 409, notifications list/unread-count/read-all). Slow tests wait 12s/28s/6s so full suite takes ~40s using pytest-xdist. Frontend E2E on mobile viewport 390x844 via preview URL: demo login (andi@eatly.com) -> Beranda loads 6 restoran/reels -> tap 'Warung Sinar Bahagia' -> tap 'Tambah' on Rendang Sapi opens CustomizeSheet with required Level Pedas/Pilihan Nasi PRE-SELECTED (Tidak Pedas / Nasi Putih) so 'Tambah ke Keranjang' works immediately -> Cart shows Rp 68.000 -> Checkout page 'Ringkasan & Bayar' loads with Pilih Meja (A1..C2), Waktu Kedatangan (Sekarang/07:00..08:45), Kode Promo, Metode Pembayaran (QRIS/GoPay/Card/Cash). Selecting Meja A1 + Sekarang + applying HEMAT10 correctly discounts total to Rp 58.000. 'Bayar Sekarang' submits and navigates to /payment-success?id=... showing green check, QR code, Kode Pesanan (ETL-2938), Meja A1, Sekarang, Total Rp 58.000. Tab Pesanan shows the new order as 'Dibayar' plus older ones auto-progressed to 'Siap'. /notifications shows 'Pembayaran berhasil', 'Pesanan sedang disiapkan', 'Pesanan siap!', 'Pesanan selesai' entries with timestamps. No red-screen or pageerror this iteration. Non-blocking: same react-native-web console warnings from iteration 1 persist (shadow* deprecated, props.pointerEvents deprecated).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Global (react-native-web console)", "issues": [
+        "Deprecation: 'shadow*' style props are deprecated. Use 'boxShadow'.",
+        "Deprecation: props.pointerEvents is deprecated. Use style.pointerEvents (restaurant detail)."
+      ]}
+    ],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_orders_reviews_notifications.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Low priority) Replace deprecated shadow* style props with boxShadow across screens/components to silence RN web warnings.",
+    "(Low priority) Replace remaining props.pointerEvents with style.pointerEvents in restaurant/[id].tsx.",
+    "(Low priority) FastAPI @app.on_event startup/shutdown are deprecated — migrate to lifespan context handler in a future iteration.",
+    "(Low priority) server.py is ~1000 lines — consider splitting into routers/{auth,restaurants,orders,reviews,notifications}.py + seed.py to stay under 700 lines per file."
+  ],
+  "critical_code_review_comments": [
+    "Order create: unit_price mutation with price_delta correctly supports negative deltas (Tanpa Nasi -5000) and multi-choice add-ons; verified via HEMAT10 test math.",
+    "Cancel window uses server-side elapsed check — safe against client clock manipulation. Good.",
+    "_persist_status persists status monotonic (never moves backwards from stored explicit status via STATUS_RANK) and always fires exactly one notification per transition. Good.",
+    "Duplicate review returns 409, but if the restaurant_id points to a deleted restaurant, the rating aggregate silently skips update. Acceptable but worth a log.",
+    "Notification model has no pagination — list_notifications caps at 100 which is fine now, but consider cursor-based pagination once Phase 4 adds broader notifications."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_orders_reviews_notifications.py (new)"
+  ],
+  "success_rate": {"backend": "100% (29/29)", "frontend": "100% for Phase 2/3 flow (login->menu->cart->checkout->payment-success->orders->notifications all working)"},
+  "seed_data_creation": "Test-suite created several orders on the demo user (andi@eatly.com) and 1 completed order with review 'TEST_mantap' on Warung Sinar Bahagia. Volume is small and reviewed reviews are TEST_-prefixed for easy cleanup.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend regression at /app/backend/tests/ — run `pytest /app/backend/tests/ -v` (~40s incl. slow status-progression waits of 12s/28s/6s). Base URL from EXPO_PUBLIC_BACKEND_URL in /app/frontend/.env. Demo creds: andi@eatly.com / password123. Warung Sinar Bahagia's Rendang Sapi & Nasi Goreng have required option groups (Level Pedas, Pilihan Nasi) — client pre-selects the first delta-0 choice on open. Order status auto-advances every 5s via _order_progression_loop: paid->preparing at 10s, preparing->ready at 25s; cancel window is 5s; complete requires status=ready. Promos: NEWFAM (-15k), EATLY25 (-25k, min 100k), HEMAT10 (-10k). Payment is MOCKED — /orders returns status='paid' immediately.",
+  "rca_of_issue": "N/A — no functional bugs found this iteration."
+}

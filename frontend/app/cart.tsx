@@ -8,7 +8,6 @@ import { Button } from "@/src/components/ui/Button";
 import { StateView } from "@/src/components/ui/StateView";
 import { Stepper } from "@/src/components/ui/Stepper";
 import { useCart } from "@/src/context/cart-context";
-import { useToast } from "@/src/context/toast-context";
 import { fonts } from "@/src/fonts";
 import { makeStyles, radius, spacing, useTheme } from "@/src/theme";
 import { formatRupiah } from "@/src/utils/format";
@@ -18,7 +17,6 @@ export default function CartScreen() {
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { show } = useToast();
   const { items, restaurantName, subtotal, count, incrementLine, decrementLine, removeLine } = useCart();
 
   const empty = items.length === 0;
@@ -121,7 +119,7 @@ export default function CartScreen() {
                 label="Lanjut ke Pembayaran"
                 iconRight="arrow-forward"
                 testID="cart-checkout"
-                onPress={() => show("Checkout & pembayaran hadir di fase berikutnya", "info")}
+                onPress={() => router.push("/checkout")}
                 fullWidth={false}
               />
             </View>

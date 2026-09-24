@@ -1,113 +1,80 @@
-import { createContext, useContext, useEffect, useMemo, useState, useCallback, useRef, ReactNode } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { createContext, useContext, useMemo, useCallback, ReactNode } from "react";
 
-import { CartItem, DineInInfo, Order, OrderStatus, PaymentMethodId } from "@/src/types";
-import { storage } from "@/src/utils/storage";
-
-const ORDERS_KEY = "eatly_orders";
-
-type CreateInput = {
-  items: CartItem[];
-  restaurantId: string;
-  restaurantName: string;
-  restaurantAvatar: string;
-  dineIn: DineInInfo;
-  paymentMethod: PaymentMethodId;
-  promoCode: string | null;
-  subtotal: number;
-  discount: number;
-  total: number;
-};
+import {
+  CreateOrderBody,
+  cancelOrderRequest,
+  completeOrderRequest,
+  createOrderRequest,
+  fetchOrders,
+} from "@/src/api/orders";
+import { useAuth } from "@/src/context/auth-context";
+import { Order } from "@/src/types";
 
 type OrdersState = {
   orders: Order[];
-  createOrder: (input: CreateInput) => Order;
+  loading: boolean;
+  createOrder: (body: CreateOrderBody) => Promise<Order>;
+  cancelOrder: (id: string) => Promise<Order>;
+  completeOrder: (id: string) => Promise<Order>;
   getOrder: (id: string) => Order | undefined;
-  updateStatus: (id: string, status: OrderStatus) => void;
+  refetch: () => void;
 };
 
 const OrdersContext = createContext<OrdersState | undefined>(undefined);
 
-// Auto-advance flow for demo: paid -> preparing -> ready.
-const NEXT: Partial<Record<OrderStatus, OrderStatus>> = {
-  paid: "preparing",
-  preparing: "ready",
-};
-
-function makeId() {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-function makeCode() {
-  return `ETL-${Math.floor(1000 + Math.random() * 9000)}`;
-}
-
 export function OrdersProvider({ children }: { children: ReactNode }) {
-  const [orders, setOrders] = useState<Order[]>([]);
-  const ordersRef = useRef<Order[]>([]);
+  const { user } = useAuth();
+  const qc = useQueryClient();
 
-  useEffect(() => {
-    ordersRef.current = orders;
-  }, [orders]);
+  const { data, isLoading, refetch } = useQuery({
+    queryKey: ["orders"],
+    queryFn: fetchOrders,
+    enabled: !!user,
+    // Poll so kitchen status + notifications stay fresh while an order is active.
+    refetchInterval: 5000,
+    staleTime: 2000,
+  });
 
-  useEffect(() => {
-    (async () => {
-      const raw = await storage.getItem<string>(ORDERS_KEY, "[]");
-      try {
-        const parsed = JSON.parse(raw ?? "[]");
-        if (Array.isArray(parsed)) setOrders(parsed);
-      } catch {
-        // ignore
-      }
-    })();
-  }, []);
-
-  const persist = useCallback((next: Order[]) => {
-    setOrders(next);
-    storage.setItem(ORDERS_KEY, JSON.stringify(next));
-  }, []);
-
-  const updateStatus = useCallback(
-    (id: string, status: OrderStatus) => {
-      const next = ordersRef.current.map((o) => (o.id === id ? { ...o, status } : o));
-      persist(next);
-    },
-    [persist],
-  );
-
-  // Simulate kitchen progression every 7s for active orders.
-  useEffect(() => {
-    const timer = setInterval(() => {
-      const active = ordersRef.current.filter((o) => o.status === "paid" || o.status === "preparing");
-      if (active.length === 0) return;
-      const next = ordersRef.current.map((o) => {
-        const n = NEXT[o.status];
-        return n ? { ...o, status: n } : o;
-      });
-      persist(next);
-    }, 7000);
-    return () => clearInterval(timer);
-  }, [persist]);
+  const orders = useMemo(() => data ?? [], [data]);
 
   const createOrder = useCallback(
-    (input: CreateInput) => {
-      const order: Order = {
-        id: makeId(),
-        code: makeCode(),
-        ...input,
-        status: "paid",
-        qrToken: `EATLY|${makeCode()}|${Date.now()}`,
-        createdAt: Date.now(),
-      };
-      persist([order, ...ordersRef.current]);
+    async (body: CreateOrderBody) => {
+      const order = await createOrderRequest(body);
+      // Make it immediately visible to the success/tracking screens.
+      qc.setQueryData<Order[]>(["orders"], (old) => [order, ...(old ?? [])]);
+      qc.invalidateQueries({ queryKey: ["orders"] });
+      qc.invalidateQueries({ queryKey: ["notifications"] });
       return order;
     },
-    [persist],
+    [qc],
   );
 
-  const getOrder = useCallback((id: string) => ordersRef.current.find((o) => o.id === id), []);
+  const cancelOrder = useCallback(
+    async (id: string) => {
+      const order = await cancelOrderRequest(id);
+      qc.setQueryData<Order[]>(["orders"], (old) => (old ?? []).map((o) => (o.id === id ? order : o)));
+      qc.invalidateQueries({ queryKey: ["notifications"] });
+      return order;
+    },
+    [qc],
+  );
+
+  const completeOrder = useCallback(
+    async (id: string) => {
+      const order = await completeOrderRequest(id);
+      qc.setQueryData<Order[]>(["orders"], (old) => (old ?? []).map((o) => (o.id === id ? order : o)));
+      qc.invalidateQueries({ queryKey: ["notifications"] });
+      return order;
+    },
+    [qc],
+  );
+
+  const getOrder = useCallback((id: string) => orders.find((o) => o.id === id), [orders]);
 
   const value = useMemo<OrdersState>(
-    () => ({ orders, createOrder, getOrder, updateStatus }),
-    [orders, createOrder, getOrder, updateStatus],
+    () => ({ orders, loading: isLoading, createOrder, cancelOrder, completeOrder, getOrder, refetch }),
+    [orders, isLoading, createOrder, cancelOrder, completeOrder, getOrder, refetch],
   );
 
   return <OrdersContext.Provider value={value}>{children}</OrdersContext.Provider>;

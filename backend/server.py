@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import asyncio
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, BeforeValidator, ConfigDict
@@ -341,11 +342,406 @@ async def root():
     return {"message": "Eatly API"}
 
 
+# ---------------------------------------------------------------------------
+# Orders — server-side price validation, status flow, cancellation rules
+# ---------------------------------------------------------------------------
+CANCEL_WINDOW_SECONDS = 5           # user may cancel only within 5s of creation
+PAID_UNTIL_SECONDS = 10             # paid -> preparing after 10s
+PREPARING_UNTIL_SECONDS = 25        # preparing -> ready after 25s
+STATUS_RANK = {"paid": 0, "preparing": 1, "ready": 2, "completed": 3, "cancelled": -1}
+
+# Mirror of the client promo table — the SERVER is the source of truth.
+PROMOS = {
+    "NEWFAM": {"discount": 15000, "min_subtotal": 0, "label": "Diskon Rp 15.000"},
+    "EATLY25": {"discount": 25000, "min_subtotal": 100000, "label": "Diskon Rp 25.000"},
+    "HEMAT10": {"discount": 10000, "min_subtotal": 0, "label": "Diskon Rp 10.000"},
+}
+PAYMENT_METHODS = {"qris", "gopay", "card", "cash"}
+
+
+class OrderItemIn(BaseModel):
+    menu_item_id: str
+    quantity: int = Field(ge=1, le=50)
+    options: List[dict] = []          # [{ "group": str, "choice": str }]
+    notes: str = ""
+
+
+class DineInIn(BaseModel):
+    table: str
+    time: str
+
+
+class CreateOrderIn(BaseModel):
+    restaurant_id: str
+    items: List[OrderItemIn] = Field(min_length=1)
+    dine_in: DineInIn
+    payment_method: str
+    promo_code: Optional[str] = None
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_dt(v) -> datetime:
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    try:
+        d = datetime.fromisoformat(str(v))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return _now()
+
+
+def _effective_status(status: str, created_at) -> str:
+    """Deterministic time-based progression (no trust in client)."""
+    if status in ("completed", "cancelled"):
+        return status
+    elapsed = (_now() - _parse_dt(created_at)).total_seconds()
+    if elapsed >= PREPARING_UNTIL_SECONDS:
+        target = "ready"
+    elif elapsed >= PAID_UNTIL_SECONDS:
+        target = "preparing"
+    else:
+        target = "paid"
+    # never move backwards from an explicitly stored status
+    return target if STATUS_RANK[target] > STATUS_RANK[status] else status
+
+
+def _make_public_order(doc: dict) -> dict:
+    items = []
+    for i, it in enumerate(doc.get("items", [])):
+        items.append({
+            "lineId": it.get("line_id", f"{doc['_id']}-{i}"),
+            "restaurantId": doc.get("restaurant_id", ""),
+            "restaurantName": doc.get("restaurant_name", ""),
+            "menuItemId": it.get("menu_item_id", ""),
+            "name": it.get("name", ""),
+            "image": it.get("image", ""),
+            "basePrice": it.get("base_price", 0),
+            "unitPrice": it.get("unit_price", 0),
+            "quantity": it.get("quantity", 1),
+            "options": it.get("options", []),
+            "notes": it.get("notes", ""),
+        })
+    created_at = _parse_dt(doc.get("created_at"))
+    return {
+        "id": str(doc["_id"]),
+        "code": doc.get("code", ""),
+        "restaurantId": doc.get("restaurant_id", ""),
+        "restaurantName": doc.get("restaurant_name", ""),
+        "restaurantAvatar": doc.get("restaurant_avatar", ""),
+        "items": items,
+        "dineIn": {"table": doc.get("dine_in", {}).get("table", ""), "time": doc.get("dine_in", {}).get("time", "")},
+        "paymentMethod": doc.get("payment_method", "qris"),
+        "promoCode": doc.get("promo_code"),
+        "subtotal": doc.get("subtotal", 0),
+        "discount": doc.get("discount", 0),
+        "total": doc.get("total", 0),
+        "status": doc.get("status", "paid"),
+        "qrToken": doc.get("qr_token", ""),
+        "createdAt": int(created_at.timestamp() * 1000),
+        "reviewed": bool(doc.get("reviewed", False)),
+        "cancellableUntil": int((created_at.timestamp() + CANCEL_WINDOW_SECONDS) * 1000),
+    }
+
+
+async def _add_notification(user_id: str, title: str, body: str, order_id: str = "", ntype: str = "order"):
+    await db.notifications.insert_one({
+        "user_id": user_id,
+        "title": title,
+        "body": body,
+        "order_id": order_id,
+        "type": ntype,
+        "read": False,
+        "created_at": _now().isoformat(),
+    })
+
+
+STATUS_NOTIF = {
+    "preparing": ("Pesanan sedang disiapkan", "Dapur mulai menyiapkan pesananmu."),
+    "ready": ("Pesanan siap!", "Tunjukkan QR ke staf restoran untuk verifikasi."),
+    "completed": ("Pesanan selesai", "Terima kasih! Jangan lupa beri ulasan."),
+    "cancelled": ("Pesanan dibatalkan", "Pesananmu telah dibatalkan."),
+}
+
+
+async def _persist_status(doc: dict) -> dict:
+    """Recompute + persist the time-based status; emit a notification on change."""
+    eff = _effective_status(doc.get("status", "paid"), doc.get("created_at"))
+    if eff != doc.get("status"):
+        await db.orders.update_one({"_id": doc["_id"]}, {"$set": {"status": eff}})
+        doc["status"] = eff
+        if eff in STATUS_NOTIF:
+            title, body = STATUS_NOTIF[eff]
+            await _add_notification(str(doc["user_id"]), title, body, str(doc["_id"]))
+    return doc
+
+
+@api_router.post("/orders")
+async def create_order(body: CreateOrderIn, current: dict = Depends(get_current_user)):
+    if body.payment_method not in PAYMENT_METHODS:
+        raise HTTPException(status_code=400, detail="Metode pembayaran tidak valid")
+    if not ObjectId.is_valid(body.restaurant_id):
+        raise HTTPException(status_code=404, detail="Restoran tidak ditemukan")
+    resto = await db.restaurants.find_one({"_id": ObjectId(body.restaurant_id)})
+    if not resto:
+        raise HTTPException(status_code=404, detail="Restoran tidak ditemukan")
+    if resto.get("status") == "tutup" or resto.get("availability") == "closed":
+        raise HTTPException(status_code=400, detail="Restoran sedang tutup")
+
+    snapshot_items = []
+    subtotal = 0
+    for line in body.items:
+        if not ObjectId.is_valid(line.menu_item_id):
+            raise HTTPException(status_code=400, detail="Menu tidak valid")
+        mi = await db.menu_items.find_one({"_id": ObjectId(line.menu_item_id)})
+        if not mi or mi.get("restaurant_id") != body.restaurant_id:
+            raise HTTPException(status_code=400, detail="Menu tidak ditemukan di restoran ini")
+        if not mi.get("available", True):
+            raise HTTPException(status_code=400, detail=f"{mi.get('name','Menu')} sedang tidak tersedia")
+
+        groups = mi.get("options", [])
+        chosen = line.options or []
+        # index chosen by group
+        chosen_by_group: dict = {}
+        for c in chosen:
+            chosen_by_group.setdefault(c.get("group"), []).append(c.get("choice"))
+
+        unit_price = mi.get("price", 0)
+        resolved_options = []
+        for g in groups:
+            gname = g.get("name")
+            gtype = g.get("type", "single")
+            picks = chosen_by_group.get(gname, [])
+            if g.get("required") and len(picks) == 0:
+                raise HTTPException(status_code=400, detail=f"Pilihan '{gname}' wajib diisi")
+            if gtype == "single" and len(picks) > 1:
+                raise HTTPException(status_code=400, detail=f"Pilihan '{gname}' hanya boleh satu")
+            valid_choices = {ch["name"]: ch.get("price_delta", 0) for ch in g.get("choices", [])}
+            for pick in picks:
+                if pick not in valid_choices:
+                    raise HTTPException(status_code=400, detail=f"Pilihan '{pick}' tidak valid")
+                delta = valid_choices[pick]
+                unit_price += delta
+                resolved_options.append({"group": gname, "choice": pick, "price_delta": delta})
+
+        subtotal += unit_price * line.quantity
+        snapshot_items.append({
+            "line_id": f"{line.menu_item_id}-{len(snapshot_items)}",
+            "menu_item_id": line.menu_item_id,
+            "name": mi.get("name", ""),
+            "image": mi.get("image", ""),
+            "base_price": mi.get("price", 0),
+            "unit_price": unit_price,
+            "quantity": line.quantity,
+            "options": resolved_options,
+            "notes": (line.notes or "").strip()[:200],
+        })
+
+    # Promo (server-validated)
+    discount = 0
+    promo_code = None
+    if body.promo_code and body.promo_code.strip():
+        key = body.promo_code.strip().upper()
+        promo = PROMOS.get(key)
+        if not promo:
+            raise HTTPException(status_code=400, detail="Kode promo tidak valid")
+        if subtotal < promo["min_subtotal"]:
+            raise HTTPException(status_code=400, detail=f"Min. pembelian Rp {promo['min_subtotal']:,}".replace(",", "."))
+        discount = min(promo["discount"], subtotal)
+        promo_code = key
+
+    total = max(0, subtotal - discount)
+    now = _now()
+    code = f"ETL-{int(now.timestamp()) % 10000:04d}"
+    order_doc = {
+        "user_id": str(current["_id"]),
+        "code": code,
+        "restaurant_id": body.restaurant_id,
+        "restaurant_name": resto.get("name", ""),
+        "restaurant_avatar": resto.get("avatar_image", ""),
+        "items": snapshot_items,
+        "dine_in": {"table": body.dine_in.table, "time": body.dine_in.time},
+        "payment_method": body.payment_method,
+        "promo_code": promo_code,
+        "subtotal": subtotal,
+        "discount": discount,
+        "total": total,
+        "status": "paid",
+        "qr_token": f"EATLY|{code}|{int(now.timestamp())}",
+        "reviewed": False,
+        "created_at": now.isoformat(),
+    }
+    res = await db.orders.insert_one(order_doc)
+    order_doc["_id"] = res.inserted_id
+    await db.users.update_one({"_id": current["_id"]}, {"$inc": {"total_orders": 1}})
+    await _add_notification(str(current["_id"]), "Pembayaran berhasil",
+                            f"Pesanan {code} di {resto.get('name','')} diterima.", str(res.inserted_id))
+    return _make_public_order(order_doc)
+
+
+@api_router.get("/orders")
+async def list_orders(current: dict = Depends(get_current_user)):
+    docs = await db.orders.find({"user_id": str(current["_id"])}).sort("created_at", -1).to_list(200)
+    out = []
+    for d in docs:
+        d = await _persist_status(d)
+        out.append(_make_public_order(d))
+    return out
+
+
+@api_router.get("/orders/{order_id}")
+async def get_order(order_id: str, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(order_id):
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    doc = await db.orders.find_one({"_id": ObjectId(order_id), "user_id": str(current["_id"])})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    doc = await _persist_status(doc)
+    return _make_public_order(doc)
+
+
+@api_router.post("/orders/{order_id}/cancel")
+async def cancel_order(order_id: str, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(order_id):
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    doc = await db.orders.find_one({"_id": ObjectId(order_id), "user_id": str(current["_id"])})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    if doc.get("status") in ("completed", "cancelled"):
+        raise HTTPException(status_code=400, detail="Pesanan ini tidak dapat dibatalkan")
+    elapsed = (_now() - _parse_dt(doc.get("created_at"))).total_seconds()
+    if elapsed > CANCEL_WINDOW_SECONDS:
+        raise HTTPException(status_code=400, detail="Batas waktu pembatalan sudah lewat")
+    await db.orders.update_one({"_id": doc["_id"]}, {"$set": {"status": "cancelled"}})
+    await db.users.update_one({"_id": current["_id"]}, {"$inc": {"total_orders": -1}})
+    doc["status"] = "cancelled"
+    await _add_notification(str(current["_id"]), *STATUS_NOTIF["cancelled"], str(doc["_id"]))
+    return _make_public_order(doc)
+
+
+@api_router.post("/orders/{order_id}/complete")
+async def complete_order(order_id: str, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(order_id):
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    doc = await db.orders.find_one({"_id": ObjectId(order_id), "user_id": str(current["_id"])})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    doc = await _persist_status(doc)
+    if doc.get("status") != "ready":
+        raise HTTPException(status_code=400, detail="Pesanan belum siap untuk diselesaikan")
+    await db.orders.update_one({"_id": doc["_id"]}, {"$set": {"status": "completed"}})
+    doc["status"] = "completed"
+    await _add_notification(str(current["_id"]), *STATUS_NOTIF["completed"], str(doc["_id"]))
+    return _make_public_order(doc)
+
+
+# ---------------------------------------------------------------------------
+# Reviews
+# ---------------------------------------------------------------------------
+class CreateReviewIn(BaseModel):
+    order_id: str
+    rating: int = Field(ge=1, le=5)
+    comment: str = ""
+
+
+@api_router.post("/reviews")
+async def create_review(body: CreateReviewIn, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(body.order_id):
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    order = await db.orders.find_one({"_id": ObjectId(body.order_id), "user_id": str(current["_id"])})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    if order.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Hanya pesanan selesai yang bisa diulas")
+    if order.get("reviewed"):
+        raise HTTPException(status_code=409, detail="Pesanan ini sudah diulas")
+
+    rid = order.get("restaurant_id")
+    review_doc = {
+        "user_id": str(current["_id"]),
+        "user_name": current.get("name", "Pengguna"),
+        "user_avatar": current.get("avatar_url", ""),
+        "restaurant_id": rid,
+        "order_id": body.order_id,
+        "rating": body.rating,
+        "comment": (body.comment or "").strip()[:500],
+        "created_at": _now().isoformat(),
+    }
+    await db.reviews.insert_one(review_doc)
+    await db.orders.update_one({"_id": order["_id"]}, {"$set": {"reviewed": True}})
+
+    # Blend into restaurant aggregate (treat existing rating/count as prior).
+    if ObjectId.is_valid(rid):
+        resto = await db.restaurants.find_one({"_id": ObjectId(rid)})
+        if resto:
+            old_rating = float(resto.get("rating", 0) or 0)
+            old_count = int(resto.get("review_count", 0) or 0)
+            new_count = old_count + 1
+            new_rating = round((old_rating * old_count + body.rating) / new_count, 1)
+            await db.restaurants.update_one(
+                {"_id": ObjectId(rid)},
+                {"$set": {"rating": new_rating, "review_count": new_count}},
+            )
+    return {"ok": True}
+
+
+@api_router.get("/restaurants/{restaurant_id}/reviews")
+async def list_reviews(restaurant_id: str):
+    docs = await db.reviews.find({"restaurant_id": restaurant_id}).sort("created_at", -1).to_list(200)
+    out = []
+    for d in docs:
+        out.append({
+            "id": str(d["_id"]),
+            "userName": d.get("user_name", "Pengguna"),
+            "userAvatar": d.get("user_avatar", ""),
+            "rating": d.get("rating", 5),
+            "comment": d.get("comment", ""),
+            "createdAt": int(_parse_dt(d.get("created_at")).timestamp() * 1000),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+@api_router.get("/notifications")
+async def list_notifications(current: dict = Depends(get_current_user)):
+    docs = await db.notifications.find({"user_id": str(current["_id"])}).sort("created_at", -1).to_list(100)
+    return [{
+        "id": str(d["_id"]),
+        "title": d.get("title", ""),
+        "body": d.get("body", ""),
+        "orderId": d.get("order_id", ""),
+        "type": d.get("type", "order"),
+        "read": bool(d.get("read", False)),
+        "createdAt": int(_parse_dt(d.get("created_at")).timestamp() * 1000),
+    } for d in docs]
+
+
+@api_router.get("/notifications/unread-count")
+async def unread_count(current: dict = Depends(get_current_user)):
+    count = await db.notifications.count_documents({"user_id": str(current["_id"]), "read": False})
+    return {"count": count}
+
+
+@api_router.post("/notifications/read-all")
+async def read_all_notifications(current: dict = Depends(get_current_user)):
+    await db.notifications.update_many({"user_id": str(current["_id"]), "read": False}, {"$set": {"read": True}})
+    return {"ok": True}
+
+
 app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
+    # Bearer-token auth (Authorization header), no cookies — credentials are not
+    # needed. allow_credentials=True combined with a "*" origin is rejected by
+    # browsers (preflight passes but the real request is blocked), which surfaced
+    # as a bare "failed to fetch" on login/register. Keeping credentials False
+    # makes the "*" origin valid for every client.
+    allow_credentials=False,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
@@ -574,11 +970,28 @@ async def seed_data():
     logger.info("Seed complete.")
 
 
+async def _order_progression_loop():
+    """Advance active orders on a timer so status updates + notifications
+    happen even when the client isn't polling that specific order."""
+    while True:
+        try:
+            await asyncio.sleep(5)
+            docs = await db.orders.find({"status": {"$in": ["paid", "preparing"]}}).to_list(500)
+            for d in docs:
+                await _persist_status(d)
+        except Exception as e:  # keep the loop alive
+            logger.warning(f"progression loop error: {e}")
+
+
 @app.on_event("startup")
 async def on_startup():
     await db.users.create_index("email", unique=True)
     await db.users.create_index("username", unique=True)
+    await db.orders.create_index("user_id")
+    await db.notifications.create_index("user_id")
+    await db.reviews.create_index("restaurant_id")
     await seed_data()
+    asyncio.create_task(_order_progression_loop())
 
 
 @app.on_event("shutdown")

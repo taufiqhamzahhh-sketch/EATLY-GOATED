@@ -108,4 +108,25 @@ export type Order = {
   status: OrderStatus;
   qrToken: string;
   createdAt: number;
+  reviewed?: boolean;
+  cancellableUntil?: number;
+};
+
+export type Review = {
+  id: string;
+  userName: string;
+  userAvatar: string;
+  rating: number;
+  comment: string;
+  createdAt: number;
+};
+
+export type AppNotification = {
+  id: string;
+  title: string;
+  body: string;
+  orderId: string;
+  type: string;
+  read: boolean;
+  createdAt: number;
 };

@@ -1,7 +1,23 @@
+import { Platform } from "react-native";
+
 import { storage } from "@/src/utils/storage";
 
-const BASE = process.env.EXPO_PUBLIC_BACKEND_URL;
 export const TOKEN_KEY = "eatly_token";
+
+// Resolve the API base URL at request time:
+// - Web served from a real domain (preview/production): call the SAME origin.
+//   The ingress routes "/api/*" to the backend, so requests are same-origin —
+//   no CORS preflight, and immune to a stale EXPO_PUBLIC_BACKEND_URL pointing
+//   at an old preview domain (the classic cause of "failed to fetch").
+// - Web on localhost (dev) and native (Expo Go): use EXPO_PUBLIC_BACKEND_URL.
+function apiBase(): string {
+  if (Platform.OS === "web" && typeof window !== "undefined" && window.location) {
+    const host = window.location.hostname;
+    const isLocal = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+    if (!isLocal) return window.location.origin;
+  }
+  return process.env.EXPO_PUBLIC_BACKEND_URL ?? "";
+}
 
 export class ApiError extends Error {
   status: number;
@@ -23,7 +39,16 @@ export async function apiFetch<T>(
     if (token) headers.set("Authorization", `Bearer ${token}`);
   }
 
-  const res = await fetch(`${BASE}/api${path}`, { ...options, headers });
+  let res: Response;
+  try {
+    res = await fetch(`${apiBase()}/api${path}`, { ...options, headers });
+  } catch {
+    // Network/CORS failure (fetch throws TypeError("Failed to fetch")).
+    throw new ApiError(
+      "Tidak dapat terhubung ke server. Periksa koneksi internet lalu coba lagi.",
+      0,
+    );
+  }
 
   if (!res.ok) {
     let detail = `Terjadi kesalahan (${res.status})`;

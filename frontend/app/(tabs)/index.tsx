@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
 import { useMemo, useState } from "react";
-import { RefreshControl, ScrollView, Text, TextInput, View } from "react-native";
+import { Pressable, RefreshControl, ScrollView, Text, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Ionicons from "@react-native-vector-icons/ionicons";
 
@@ -10,6 +10,7 @@ import { RestaurantCard } from "@/src/components/RestaurantCard";
 import { Skeleton } from "@/src/components/ui/Skeleton";
 import { StateView } from "@/src/components/ui/StateView";
 import { fetchReels, fetchRestaurants } from "@/src/api/restaurants";
+import { fetchUnreadCount } from "@/src/api/notifications";
 import { useAuth } from "@/src/context/auth-context";
 import { fonts } from "@/src/fonts";
 import { makeStyles, radius, spacing, useTheme } from "@/src/theme";
@@ -24,6 +25,13 @@ export default function BerandaScreen() {
 
   const reelsQuery = useQuery({ queryKey: ["reels"], queryFn: fetchReels });
   const restaurantsQuery = useQuery({ queryKey: ["restaurants"], queryFn: () => fetchRestaurants() });
+  const unreadQuery = useQuery({
+    queryKey: ["notifications-unread"],
+    queryFn: fetchUnreadCount,
+    enabled: !!user,
+    refetchInterval: 5000,
+  });
+  const unread = unreadQuery.data?.count ?? 0;
 
   const restaurants = restaurantsQuery.data ?? [];
   const community = restaurants.filter((r) => r.community_pick);
