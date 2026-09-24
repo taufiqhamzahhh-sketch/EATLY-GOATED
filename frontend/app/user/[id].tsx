@@ -87,6 +87,12 @@ export default function UserProfileScreen() {
           </View>
           <View style={styles.info}>
             <Text style={styles.name}>{profile.name}</Text>
+            {profile.featured ? (
+              <View style={styles.creatorBadge} testID="profile-creator-badge">
+                <Ionicons name="ribbon" size={12} color={colors.onBrandTertiary} />
+                <Text style={styles.creatorBadgeText}>Kreator Pilihan</Text>
+              </View>
+            ) : null}
             {profile.bio ? <Text style={styles.bio}>{profile.bio}</Text> : null}
           </View>
 
@@ -169,6 +175,18 @@ const useStyles = makeStyles((colors) => ({
   statLabel: { fontFamily: fonts.regular, fontSize: 12, color: colors.muted, marginTop: 2 },
   info: { paddingHorizontal: spacing.lg, marginTop: spacing.md, gap: 3 },
   name: { fontFamily: fonts.bold, fontSize: 15, color: colors.onSurface },
+  creatorBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    alignSelf: "flex-start",
+    backgroundColor: colors.brandTertiary,
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 3,
+    marginTop: 2,
+  },
+  creatorBadgeText: { fontFamily: fonts.bold, fontSize: 10.5, color: colors.onBrandTertiary },
   bio: { fontFamily: fonts.regular, fontSize: 13.5, color: colors.onSurfaceTertiary, lineHeight: 19 },
   followBtn: {
     marginHorizontal: spacing.lg,

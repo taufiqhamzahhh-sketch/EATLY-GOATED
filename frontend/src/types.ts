@@ -198,11 +198,26 @@ export type SocialProfile = {
   avatar: string;
   bio: string;
   verified: boolean;
+  featured: boolean;
   postCount: number;
   followerCount: number;
   followingCount: number;
   isFollowing: boolean;
   isSelf: boolean;
+};
+
+export type FeaturedCreator = {
+  id: string;
+  name: string;
+  username: string;
+  avatar: string;
+  verified: boolean;
+  bio: string;
+  badge: string;
+  followerCount: number;
+  postCount: number;
+  thumbs: string[];
+  following: boolean;
 };
 
 export type SearchResults = {

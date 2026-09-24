@@ -6,6 +6,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Ionicons from "@react-native-vector-icons/ionicons";
 
 import { CommentsSheet } from "@/src/components/social/CommentsSheet";
+import { FeaturedCreators } from "@/src/components/social/FeaturedCreators";
 import { PostCard } from "@/src/components/social/PostCard";
 import { PostOptionsSheet } from "@/src/components/social/PostOptionsSheet";
 import { Skeleton } from "@/src/components/ui/Skeleton";
@@ -127,6 +128,7 @@ export default function FeedScreen() {
           keyExtractor={(p) => p.id}
           renderItem={renderItem}
           showsVerticalScrollIndicator={false}
+          ListHeaderComponent={scope === "foryou" ? <FeaturedCreators /> : null}
           contentContainerStyle={{ paddingBottom: bottomChrome + spacing["2xl"] }}
           onEndReachedThreshold={0.5}
           onEndReached={() => {

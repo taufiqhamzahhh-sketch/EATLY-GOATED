@@ -1218,6 +1218,7 @@ async def _social_profile(user_doc: dict, viewer_id: Optional[str]) -> dict:
         "avatar": user_doc.get("avatar_url", ""),
         "bio": user_doc.get("bio", ""),
         "verified": bool(user_doc.get("verified", False)),
+        "featured": bool(user_doc.get("featured", False)),
         "postCount": posts,
         "followerCount": followers,
         "followingCount": following,
@@ -1256,6 +1257,40 @@ async def get_saved_posts(current: dict = Depends(get_current_user)):
     order = {str(s["post_id"]): i for i, s in enumerate(saves)}
     docs.sort(key=lambda d: order.get(str(d["_id"]), 999))
     return await _serialize_posts(docs, str(current["_id"]))
+
+
+@api_router.get("/creators/featured")
+async def featured_creators(viewer: Optional[dict] = Depends(get_optional_user)):
+    viewer_id = str(viewer["_id"]) if viewer else None
+    docs = await db.users.find({"featured": True}).to_list(20)
+    following_ids = set()
+    if viewer_id:
+        rows = await db.follows.find({"follower_id": viewer_id}).to_list(2000)
+        following_ids = {r["following_id"] for r in rows}
+    out = []
+    for u in docs:
+        uid = str(u["_id"])
+        if uid == viewer_id:
+            continue
+        followers = await db.follows.count_documents({"following_id": uid})
+        post_count = await db.posts.count_documents({"user_id": uid})
+        recent = await db.posts.find({"user_id": uid}).sort("created_at", -1).to_list(3)
+        thumbs = [(p.get("media", [{}])[0].get("poster") or p.get("media", [{}])[0].get("url", "")) for p in recent]
+        out.append({
+            "id": uid,
+            "name": u.get("name", ""),
+            "username": u.get("username", ""),
+            "avatar": u.get("avatar_url", ""),
+            "verified": bool(u.get("verified", False)),
+            "bio": u.get("bio", ""),
+            "badge": "Kreator Pilihan",
+            "followerCount": followers,
+            "postCount": post_count,
+            "thumbs": [t for t in thumbs if t],
+            "following": uid in following_ids,
+        })
+    out.sort(key=lambda c: -c["followerCount"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1746,6 +1781,11 @@ async def on_startup():
     await db.reports.create_index("status")
     await seed_data()
     await seed_social()
+    # Featured food creators (idempotent) — powers the "Kreator Pilihan" row.
+    await db.users.update_many(
+        {"username": {"$in": ["sarieats", "chefrendra", "mayaeats"]}},
+        {"$set": {"featured": True}},
+    )
     asyncio.create_task(_order_progression_loop())
 
 

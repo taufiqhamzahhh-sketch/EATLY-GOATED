@@ -1,6 +1,7 @@
 import { apiFetch } from "@/src/api/client";
 import {
   CommentPage,
+  FeaturedCreator,
   FeedPage,
   Post,
   PostComment,
@@ -93,6 +94,10 @@ export function fetchUserPosts(userId: string, reelsOnly = false) {
 
 export function fetchSavedPosts() {
   return apiFetch<Post[]>("/me/saved", {}, true);
+}
+
+export function fetchFeaturedCreators() {
+  return apiFetch<FeaturedCreator[]>("/creators/featured", {}, true);
 }
 
 export function searchSocial(q: string) {
