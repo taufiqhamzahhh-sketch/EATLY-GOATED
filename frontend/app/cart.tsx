@@ -110,19 +110,17 @@ export default function CartScreen() {
 
           {/* Sticky checkout bar */}
           <View style={[styles.footer, { paddingBottom: insets.bottom + spacing.md }]}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.footerLabel}>Subtotal</Text>
+            <View style={styles.footerSummary}>
+              <Text style={styles.footerLabel}>Subtotal ({count} item)</Text>
               <Text style={styles.footerTotal}>{formatRupiah(subtotal)}</Text>
             </View>
-            <View style={styles.footerBtn}>
-              <Button
-                label="Lanjut ke Pembayaran"
-                iconRight="arrow-forward"
-                testID="cart-checkout"
-                onPress={() => router.push("/checkout")}
-                fullWidth={false}
-              />
-            </View>
+            <Button
+              label="Lanjut ke Pembayaran"
+              iconRight="arrow-forward"
+              testID="cart-checkout"
+              onPress={() => router.push("/checkout")}
+              fullWidth
+            />
           </View>
         </>
       )}
@@ -205,8 +203,6 @@ const useStyles = makeStyles((colors) => ({
     left: 0,
     right: 0,
     bottom: 0,
-    flexDirection: "row",
-    alignItems: "center",
     gap: spacing.md,
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.md,
@@ -214,7 +210,7 @@ const useStyles = makeStyles((colors) => ({
     borderTopWidth: 1,
     borderTopColor: colors.border,
   },
-  footerLabel: { fontFamily: fonts.regular, fontSize: 12.5, color: colors.muted },
-  footerTotal: { fontFamily: fonts.extrabold, fontSize: 20, color: colors.brandPrimary },
-  footerBtn: { flexShrink: 0 },
+  footerSummary: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  footerLabel: { fontFamily: fonts.medium, fontSize: 14, color: colors.muted },
+  footerTotal: { fontFamily: fonts.extrabold, fontSize: 22, color: colors.brandPrimary },
 }));

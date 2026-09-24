@@ -268,21 +268,19 @@ export default function CheckoutScreen() {
 
           {/* Sticky pay bar */}
           <View style={[styles.footer, { paddingBottom: insets.bottom + spacing.md }]}>
-            <View style={{ flex: 1 }}>
+            <View style={styles.footerSummary}>
               <Text style={styles.footerLabel}>Total Bayar</Text>
               <Text style={styles.footerTotal}>{formatRupiah(totals.total)}</Text>
             </View>
-            <View style={styles.footerBtn}>
-              <Button
-                label={paying ? "Memproses..." : "Bayar Sekarang"}
-                iconRight={paying ? undefined : "lock-closed"}
-                testID="checkout-pay"
-                onPress={handlePay}
-                loading={paying}
-                disabled={!canPay}
-                fullWidth={false}
-              />
-            </View>
+            <Button
+              label={paying ? "Memproses..." : "Bayar Sekarang"}
+              iconRight={paying ? undefined : "lock-closed"}
+              testID="checkout-pay"
+              onPress={handlePay}
+              loading={paying}
+              disabled={!canPay}
+              fullWidth
+            />
           </View>
         </KeyboardAvoidingView>
       )}
@@ -468,8 +466,6 @@ const useStyles = makeStyles((colors) => ({
     left: 0,
     right: 0,
     bottom: 0,
-    flexDirection: "row",
-    alignItems: "center",
     gap: spacing.md,
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.md,
@@ -477,7 +473,7 @@ const useStyles = makeStyles((colors) => ({
     borderTopWidth: 1,
     borderTopColor: colors.border,
   },
-  footerLabel: { fontFamily: fonts.regular, fontSize: 12.5, color: colors.muted },
-  footerTotal: { fontFamily: fonts.extrabold, fontSize: 20, color: colors.brandPrimary },
-  footerBtn: { flexShrink: 0 },
+  footerSummary: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  footerLabel: { fontFamily: fonts.medium, fontSize: 14, color: colors.muted },
+  footerTotal: { fontFamily: fonts.extrabold, fontSize: 22, color: colors.brandPrimary },
 }));
