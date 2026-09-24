@@ -93,6 +93,9 @@ export default function ProfilScreen() {
 
         {/* Menu rows */}
         <View style={styles.menu}>
+          <MenuRow icon="grid-outline" title="Profil & Kiriman Sosial" subtitle="Lihat postingan, reels, pengikut" onPress={() => router.push(`/user/${user?.id}`)} testID="profil-social" />
+          <MenuRow icon="add-circle-outline" title="Buat Konten" subtitle="Bagikan foto, carousel, atau reel" onPress={() => router.push("/create")} testID="profil-create" />
+          <MenuRow icon="bookmark-outline" title="Konten Tersimpan" onPress={() => router.push("/saved")} testID="profil-saved" />
           <MenuRow icon="receipt-outline" title="Riwayat Pesanan" subtitle={`${user?.total_orders ?? 0} pesanan · ${user?.favorites_count ?? 0} restoran favorit`} onPress={() => router.push("/(tabs)/pesanan")} testID="profil-history" />
           <MenuRow icon="heart-outline" title="Restoran Favorit" onPress={() => router.push("/(tabs)/favorit")} testID="profil-favorites" />
           <MenuRow icon="help-circle-outline" title="Bantuan & FAQ" onPress={() => show("Pusat bantuan segera hadir", "info")} testID="profil-help" />

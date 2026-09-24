@@ -130,3 +130,87 @@ export type AppNotification = {
   read: boolean;
   createdAt: number;
 };
+
+// ---------------------------------------------------------------------------
+// Social: Feed & Reels
+// ---------------------------------------------------------------------------
+export type PostType = "photo" | "carousel" | "video" | "reel";
+
+export type PostMedia = { type: "image" | "video"; url: string; poster?: string };
+
+export type PostAuthor = {
+  id: string;
+  name: string;
+  username: string;
+  avatar: string;
+  verified: boolean;
+  following: boolean;
+};
+
+export type Post = {
+  id: string;
+  type: PostType;
+  isReel: boolean;
+  author: PostAuthor;
+  media: PostMedia[];
+  caption: string;
+  hashtags: string[];
+  mentions: string[];
+  restaurantId: string | null;
+  restaurantName: string | null;
+  dishId: string | null;
+  dishName: string | null;
+  location: string;
+  likeCount: number;
+  commentCount: number;
+  saveCount: number;
+  viewCount: number;
+  liked: boolean;
+  saved: boolean;
+  createdAt: number;
+  timeAgo: string;
+};
+
+export type FeedPage = { items: Post[]; nextCursor: string | null; hasMore: boolean };
+
+export type PostComment = {
+  id: string;
+  postId: string;
+  parentId: string | null;
+  userId: string;
+  userName: string;
+  userAvatar: string;
+  text: string;
+  likeCount: number;
+  replyCount: number;
+  liked: boolean;
+  isOwner: boolean;
+  createdAt: number;
+  timeAgo: string;
+};
+
+export type CommentPage = { items: PostComment[]; nextCursor: string | null; hasMore: boolean };
+
+export type SocialProfile = {
+  id: string;
+  name: string;
+  username: string;
+  avatar: string;
+  bio: string;
+  verified: boolean;
+  postCount: number;
+  followerCount: number;
+  followingCount: number;
+  isFollowing: boolean;
+  isSelf: boolean;
+};
+
+export type SearchResults = {
+  users: { id: string; name: string; username: string; avatar: string; verified: boolean }[];
+  posts: Post[];
+  restaurants: { id: string; name: string; cuisine: string; image: string }[];
+  hashtags: { tag: string; count: number }[];
+};
+
+export type ReportTarget = "post" | "comment" | "user";
+export type ReportReason = "spam" | "inappropriate" | "harassment" | "misleading" | "copyright" | "other";

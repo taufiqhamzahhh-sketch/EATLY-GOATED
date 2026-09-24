@@ -731,6 +731,749 @@ async def read_all_notifications(current: dict = Depends(get_current_user)):
     await db.notifications.update_many({"user_id": str(current["_id"]), "read": False}, {"$set": {"read": True}})
     return {"ok": True}
 
+# ===========================================================================
+# SOCIAL: Feed & Reels (posts, likes, saves, comments, follows, reports)
+# Additive food-first social layer. Reuses users/restaurants/menu_items and
+# the existing notifications system. Nothing above this line is modified.
+# ===========================================================================
+import re as _re
+
+POST_TYPES = {"photo", "carousel", "video", "reel"}
+REPORT_TARGETS = {"post", "comment", "user"}
+REPORT_REASONS = {"spam", "inappropriate", "harassment", "misleading", "copyright", "other"}
+HASHTAG_RE = _re.compile(r"#(\w+)")
+MENTION_RE = _re.compile(r"@(\w+)")
+
+
+async def get_optional_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> Optional[dict]:
+    if not credentials or credentials.scheme.lower() != "bearer":
+        return None
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id or not ObjectId.is_valid(user_id):
+            return None
+    except jwt.PyJWTError:
+        return None
+    return await db.users.find_one({"_id": ObjectId(user_id)})
+
+
+class MediaIn(BaseModel):
+    type: str = "image"           # "image" | "video"
+    url: str
+    poster: str = ""
+
+
+class CreatePostIn(BaseModel):
+    type: str
+    media: List[MediaIn] = Field(min_length=1, max_length=10)
+    caption: str = ""
+    restaurant_id: Optional[str] = None
+    dish_id: Optional[str] = None
+    location: str = ""
+
+
+class CreateCommentIn(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+    parent_id: Optional[str] = None
+
+
+class ReportIn(BaseModel):
+    target_type: str
+    target_id: str
+    reason: str
+    note: str = ""
+
+
+def _rel_time(dt: datetime) -> str:
+    secs = (_now() - dt).total_seconds()
+    if secs < 60:
+        return "baru saja"
+    mins = int(secs // 60)
+    if mins < 60:
+        return f"{mins}m"
+    hrs = int(mins // 60)
+    if hrs < 24:
+        return f"{hrs}j"
+    days = int(hrs // 24)
+    if days < 7:
+        return f"{days}h"
+    weeks = int(days // 7)
+    if weeks < 5:
+        return f"{weeks}mg"
+    return dt.strftime("%d %b")
+
+
+async def _viewer_post_state(post_ids: List[str], viewer_id: Optional[str]) -> dict:
+    if not viewer_id or not post_ids:
+        return {}
+    liked = {d["post_id"] for d in await db.post_likes.find(
+        {"user_id": viewer_id, "post_id": {"$in": post_ids}}).to_list(1000)}
+    saved = {d["post_id"] for d in await db.post_saves.find(
+        {"user_id": viewer_id, "post_id": {"$in": post_ids}}).to_list(1000)}
+    return {"liked": liked, "saved": saved}
+
+
+async def _viewer_following(author_ids: List[str], viewer_id: Optional[str]) -> set:
+    if not viewer_id or not author_ids:
+        return set()
+    rows = await db.follows.find(
+        {"follower_id": viewer_id, "following_id": {"$in": author_ids}}).to_list(1000)
+    return {r["following_id"] for r in rows}
+
+
+def _make_public_post(doc: dict, liked: bool, saved: bool, following: bool) -> dict:
+    created = _parse_dt(doc.get("created_at"))
+    return {
+        "id": str(doc["_id"]),
+        "type": doc.get("type", "photo"),
+        "isReel": bool(doc.get("is_reel", False)),
+        "author": {
+            "id": str(doc.get("user_id", "")),
+            "name": doc.get("author_name", ""),
+            "username": doc.get("author_username", ""),
+            "avatar": doc.get("author_avatar", ""),
+            "verified": bool(doc.get("author_verified", False)),
+            "following": following,
+        },
+        "media": doc.get("media", []),
+        "caption": doc.get("caption", ""),
+        "hashtags": doc.get("hashtags", []),
+        "mentions": doc.get("mentions", []),
+        "restaurantId": doc.get("restaurant_id"),
+        "restaurantName": doc.get("restaurant_name"),
+        "dishId": doc.get("dish_id"),
+        "dishName": doc.get("dish_name"),
+        "location": doc.get("location", ""),
+        "likeCount": int(doc.get("like_count", 0)),
+        "commentCount": int(doc.get("comment_count", 0)),
+        "saveCount": int(doc.get("save_count", 0)),
+        "viewCount": int(doc.get("view_count", 0)),
+        "liked": liked,
+        "saved": saved,
+        "createdAt": int(created.timestamp() * 1000),
+        "timeAgo": _rel_time(created),
+    }
+
+
+async def _serialize_posts(docs: List[dict], viewer_id: Optional[str]) -> List[dict]:
+    ids = [str(d["_id"]) for d in docs]
+    author_ids = list({str(d.get("user_id", "")) for d in docs})
+    state = await _viewer_post_state(ids, viewer_id)
+    liked_set = state.get("liked", set())
+    saved_set = state.get("saved", set())
+    following_set = await _viewer_following(author_ids, viewer_id)
+    out = []
+    for d in docs:
+        pid = str(d["_id"])
+        is_self = viewer_id and str(d.get("user_id", "")) == viewer_id
+        out.append(_make_public_post(
+            d, pid in liked_set, pid in saved_set,
+            (str(d.get("user_id", "")) in following_set) and not is_self,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Feed / Reels
+# ---------------------------------------------------------------------------
+@api_router.get("/feed")
+async def get_feed(
+    scope: str = "foryou",
+    reels_only: bool = False,
+    cursor: Optional[str] = None,
+    limit: int = 8,
+    viewer: Optional[dict] = Depends(get_optional_user),
+):
+    limit = max(1, min(limit, 20))
+    query: dict = {}
+    if reels_only:
+        query["is_reel"] = True
+    if scope == "following":
+        if not viewer:
+            raise HTTPException(status_code=401, detail="Masuk untuk melihat feed Following")
+        vid = str(viewer["_id"])
+        follows = await db.follows.find({"follower_id": vid}).to_list(2000)
+        ids = [f["following_id"] for f in follows] + [vid]
+        query["user_id"] = {"$in": ids}
+    if cursor:
+        query["created_at"] = {"$lt": cursor}
+    docs = await db.posts.find(query).sort("created_at", -1).to_list(limit + 1)
+    has_more = len(docs) > limit
+    docs = docs[:limit]
+    viewer_id = str(viewer["_id"]) if viewer else None
+    items = await _serialize_posts(docs, viewer_id)
+    next_cursor = docs[-1].get("created_at") if (has_more and docs) else None
+    return {"items": items, "nextCursor": next_cursor, "hasMore": has_more}
+
+
+@api_router.get("/posts/{post_id}")
+async def get_post(post_id: str, viewer: Optional[dict] = Depends(get_optional_user)):
+    if not ObjectId.is_valid(post_id):
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    doc = await db.posts.find_one({"_id": ObjectId(post_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    await db.posts.update_one({"_id": doc["_id"]}, {"$inc": {"view_count": 1}})
+    viewer_id = str(viewer["_id"]) if viewer else None
+    out = await _serialize_posts([doc], viewer_id)
+    return out[0]
+
+
+@api_router.post("/posts")
+async def create_post(body: CreatePostIn, current: dict = Depends(get_current_user)):
+    if body.type not in POST_TYPES:
+        raise HTTPException(status_code=400, detail="Tipe konten tidak valid")
+    for m in body.media:
+        if m.type not in ("image", "video") or not m.url.strip():
+            raise HTTPException(status_code=400, detail="Media tidak valid")
+    is_reel = body.type == "reel"
+    if is_reel and body.media[0].type != "video":
+        raise HTTPException(status_code=400, detail="Reel harus berupa video")
+
+    restaurant_name = None
+    if body.restaurant_id:
+        if not ObjectId.is_valid(body.restaurant_id):
+            raise HTTPException(status_code=400, detail="Restoran tidak valid")
+        resto = await db.restaurants.find_one({"_id": ObjectId(body.restaurant_id)})
+        if not resto:
+            raise HTTPException(status_code=400, detail="Restoran tidak ditemukan")
+        restaurant_name = resto.get("name")
+
+    dish_name = None
+    if body.dish_id:
+        if not ObjectId.is_valid(body.dish_id):
+            raise HTTPException(status_code=400, detail="Menu tidak valid")
+        dish = await db.menu_items.find_one({"_id": ObjectId(body.dish_id)})
+        if not dish:
+            raise HTTPException(status_code=400, detail="Menu tidak ditemukan")
+        dish_name = dish.get("name")
+
+    caption = body.caption.strip()[:2000]
+    hashtags = list(dict.fromkeys(t.lower() for t in HASHTAG_RE.findall(caption)))
+    mentions = list(dict.fromkeys(m.lower() for m in MENTION_RE.findall(caption)))
+    now = _now()
+    doc = {
+        "user_id": str(current["_id"]),
+        "author_name": current.get("name", ""),
+        "author_username": current.get("username", ""),
+        "author_avatar": current.get("avatar_url", ""),
+        "author_verified": bool(current.get("verified", False)),
+        "type": body.type,
+        "is_reel": is_reel,
+        "media": [m.model_dump() for m in body.media],
+        "caption": caption,
+        "hashtags": hashtags,
+        "mentions": mentions,
+        "restaurant_id": body.restaurant_id,
+        "restaurant_name": restaurant_name,
+        "dish_id": body.dish_id,
+        "dish_name": dish_name,
+        "location": body.location.strip()[:120],
+        "like_count": 0,
+        "comment_count": 0,
+        "save_count": 0,
+        "view_count": 0,
+        "created_at": now.isoformat(),
+    }
+    res = await db.posts.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    out = await _serialize_posts([doc], str(current["_id"]))
+    return out[0]
+
+
+@api_router.delete("/posts/{post_id}")
+async def delete_post(post_id: str, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(post_id):
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    doc = await db.posts.find_one({"_id": ObjectId(post_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    if str(doc.get("user_id")) != str(current["_id"]):
+        raise HTTPException(status_code=403, detail="Kamu tidak bisa menghapus konten ini")
+    await db.posts.delete_one({"_id": doc["_id"]})
+    await db.post_likes.delete_many({"post_id": post_id})
+    await db.post_saves.delete_many({"post_id": post_id})
+    await db.comments.delete_many({"post_id": post_id})
+    return {"ok": True}
+
+
+@api_router.post("/posts/{post_id}/like")
+async def toggle_like(post_id: str, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(post_id):
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    doc = await db.posts.find_one({"_id": ObjectId(post_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    uid = str(current["_id"])
+    existing = await db.post_likes.find_one({"post_id": post_id, "user_id": uid})
+    if existing:
+        await db.post_likes.delete_one({"_id": existing["_id"]})
+        await db.posts.update_one({"_id": doc["_id"]}, {"$inc": {"like_count": -1}})
+        new_count = max(0, int(doc.get("like_count", 0)) - 1)
+        return {"liked": False, "likeCount": new_count}
+    await db.post_likes.insert_one({"post_id": post_id, "user_id": uid, "created_at": _now().isoformat()})
+    await db.posts.update_one({"_id": doc["_id"]}, {"$inc": {"like_count": 1}})
+    if str(doc.get("user_id")) != uid:
+        await _add_notification(str(doc["user_id"]), "Suka baru",
+                                f"{current.get('name','Seseorang')} menyukai kontenmu.",
+                                ntype="like")
+    return {"liked": True, "likeCount": int(doc.get("like_count", 0)) + 1}
+
+
+@api_router.post("/posts/{post_id}/save")
+async def toggle_save(post_id: str, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(post_id):
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    doc = await db.posts.find_one({"_id": ObjectId(post_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    uid = str(current["_id"])
+    existing = await db.post_saves.find_one({"post_id": post_id, "user_id": uid})
+    if existing:
+        await db.post_saves.delete_one({"_id": existing["_id"]})
+        await db.posts.update_one({"_id": doc["_id"]}, {"$inc": {"save_count": -1}})
+        return {"saved": False, "saveCount": max(0, int(doc.get("save_count", 0)) - 1)}
+    await db.post_saves.insert_one({"post_id": post_id, "user_id": uid, "created_at": _now().isoformat()})
+    await db.posts.update_one({"_id": doc["_id"]}, {"$inc": {"save_count": 1}})
+    return {"saved": True, "saveCount": int(doc.get("save_count", 0)) + 1}
+
+
+# ---------------------------------------------------------------------------
+# Comments
+# ---------------------------------------------------------------------------
+def _make_public_comment(doc: dict, liked: bool, is_owner: bool) -> dict:
+    created = _parse_dt(doc.get("created_at"))
+    return {
+        "id": str(doc["_id"]),
+        "postId": doc.get("post_id", ""),
+        "parentId": doc.get("parent_id"),
+        "userId": str(doc.get("user_id", "")),
+        "userName": doc.get("user_name", ""),
+        "userAvatar": doc.get("user_avatar", ""),
+        "text": doc.get("text", ""),
+        "likeCount": int(doc.get("like_count", 0)),
+        "replyCount": int(doc.get("reply_count", 0)),
+        "liked": liked,
+        "isOwner": is_owner,
+        "createdAt": int(created.timestamp() * 1000),
+        "timeAgo": _rel_time(created),
+    }
+
+
+async def _serialize_comments(docs: List[dict], viewer_id: Optional[str]) -> List[dict]:
+    ids = [str(d["_id"]) for d in docs]
+    liked_set = set()
+    if viewer_id and ids:
+        rows = await db.comment_likes.find(
+            {"user_id": viewer_id, "comment_id": {"$in": ids}}).to_list(1000)
+        liked_set = {r["comment_id"] for r in rows}
+    return [
+        _make_public_comment(d, str(d["_id"]) in liked_set,
+                             viewer_id is not None and str(d.get("user_id", "")) == viewer_id)
+        for d in docs
+    ]
+
+
+@api_router.get("/posts/{post_id}/comments")
+async def get_comments(
+    post_id: str,
+    parent_id: Optional[str] = None,
+    cursor: Optional[str] = None,
+    limit: int = 15,
+    viewer: Optional[dict] = Depends(get_optional_user),
+):
+    limit = max(1, min(limit, 40))
+    query: dict = {"post_id": post_id, "parent_id": parent_id}
+    if cursor:
+        query["created_at"] = {"$lt": cursor}
+    # top-level newest-first; replies oldest-first reads better
+    sort_dir = 1 if parent_id else -1
+    docs = await db.comments.find(query).sort("created_at", sort_dir).to_list(limit + 1)
+    has_more = len(docs) > limit
+    docs = docs[:limit]
+    viewer_id = str(viewer["_id"]) if viewer else None
+    items = await _serialize_comments(docs, viewer_id)
+    next_cursor = docs[-1].get("created_at") if (has_more and docs) else None
+    return {"items": items, "nextCursor": next_cursor, "hasMore": has_more}
+
+
+@api_router.post("/posts/{post_id}/comments")
+async def add_comment(post_id: str, body: CreateCommentIn, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(post_id):
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    post = await db.posts.find_one({"_id": ObjectId(post_id)})
+    if not post:
+        raise HTTPException(status_code=404, detail="Konten tidak ditemukan")
+    parent = None
+    if body.parent_id:
+        if not ObjectId.is_valid(body.parent_id):
+            raise HTTPException(status_code=400, detail="Komentar tidak valid")
+        parent = await db.comments.find_one({"_id": ObjectId(body.parent_id), "post_id": post_id})
+        if not parent:
+            raise HTTPException(status_code=404, detail="Komentar tidak ditemukan")
+    now = _now()
+    doc = {
+        "post_id": post_id,
+        "parent_id": body.parent_id,
+        "user_id": str(current["_id"]),
+        "user_name": current.get("name", ""),
+        "user_avatar": current.get("avatar_url", ""),
+        "text": body.text.strip()[:500],
+        "like_count": 0,
+        "reply_count": 0,
+        "created_at": now.isoformat(),
+    }
+    res = await db.comments.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    await db.posts.update_one({"_id": post["_id"]}, {"$inc": {"comment_count": 1}})
+    if parent:
+        await db.comments.update_one({"_id": parent["_id"]}, {"$inc": {"reply_count": 1}})
+        if str(parent.get("user_id")) != str(current["_id"]):
+            await _add_notification(str(parent["user_id"]), "Balasan baru",
+                                    f"{current.get('name','Seseorang')} membalas komentarmu.", ntype="comment")
+    elif str(post.get("user_id")) != str(current["_id"]):
+        await _add_notification(str(post["user_id"]), "Komentar baru",
+                                f"{current.get('name','Seseorang')} mengomentari kontenmu.", ntype="comment")
+    out = await _serialize_comments([doc], str(current["_id"]))
+    return out[0]
+
+
+@api_router.post("/comments/{comment_id}/like")
+async def toggle_comment_like(comment_id: str, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(comment_id):
+        raise HTTPException(status_code=404, detail="Komentar tidak ditemukan")
+    doc = await db.comments.find_one({"_id": ObjectId(comment_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Komentar tidak ditemukan")
+    uid = str(current["_id"])
+    existing = await db.comment_likes.find_one({"comment_id": comment_id, "user_id": uid})
+    if existing:
+        await db.comment_likes.delete_one({"_id": existing["_id"]})
+        await db.comments.update_one({"_id": doc["_id"]}, {"$inc": {"like_count": -1}})
+        return {"liked": False, "likeCount": max(0, int(doc.get("like_count", 0)) - 1)}
+    await db.comment_likes.insert_one({"comment_id": comment_id, "user_id": uid})
+    await db.comments.update_one({"_id": doc["_id"]}, {"$inc": {"like_count": 1}})
+    return {"liked": True, "likeCount": int(doc.get("like_count", 0)) + 1}
+
+
+@api_router.delete("/comments/{comment_id}")
+async def delete_comment(comment_id: str, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(comment_id):
+        raise HTTPException(status_code=404, detail="Komentar tidak ditemukan")
+    doc = await db.comments.find_one({"_id": ObjectId(comment_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Komentar tidak ditemukan")
+    if str(doc.get("user_id")) != str(current["_id"]):
+        raise HTTPException(status_code=403, detail="Kamu tidak bisa menghapus komentar ini")
+    reply_ids = [str(r["_id"]) for r in await db.comments.find({"parent_id": comment_id}).to_list(1000)]
+    removed = 1 + len(reply_ids)
+    await db.comments.delete_many({"$or": [{"_id": doc["_id"]}, {"parent_id": comment_id}]})
+    if doc.get("parent_id") and ObjectId.is_valid(doc["parent_id"]):
+        await db.comments.update_one({"_id": ObjectId(doc["parent_id"])}, {"$inc": {"reply_count": -1}})
+    await db.posts.update_one({"_id": ObjectId(doc["post_id"])}, {"$inc": {"comment_count": -removed}})
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Follows & social profile
+# ---------------------------------------------------------------------------
+@api_router.post("/users/{user_id}/follow")
+async def toggle_follow(user_id: str, current: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=404, detail="Pengguna tidak ditemukan")
+    if user_id == str(current["_id"]):
+        raise HTTPException(status_code=400, detail="Tidak bisa mengikuti diri sendiri")
+    target = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not target:
+        raise HTTPException(status_code=404, detail="Pengguna tidak ditemukan")
+    vid = str(current["_id"])
+    existing = await db.follows.find_one({"follower_id": vid, "following_id": user_id})
+    if existing:
+        await db.follows.delete_one({"_id": existing["_id"]})
+        following = False
+    else:
+        await db.follows.insert_one({"follower_id": vid, "following_id": user_id, "created_at": _now().isoformat()})
+        following = True
+        await _add_notification(user_id, "Pengikut baru",
+                                f"{current.get('name','Seseorang')} mulai mengikutimu.", ntype="follow")
+    follower_count = await db.follows.count_documents({"following_id": user_id})
+    return {"following": following, "followerCount": follower_count}
+
+
+async def _social_profile(user_doc: dict, viewer_id: Optional[str]) -> dict:
+    uid = str(user_doc["_id"])
+    posts = await db.posts.count_documents({"user_id": uid})
+    followers = await db.follows.count_documents({"following_id": uid})
+    following = await db.follows.count_documents({"follower_id": uid})
+    is_following = False
+    if viewer_id and viewer_id != uid:
+        is_following = bool(await db.follows.find_one({"follower_id": viewer_id, "following_id": uid}))
+    return {
+        "id": uid,
+        "name": user_doc.get("name", ""),
+        "username": user_doc.get("username", ""),
+        "avatar": user_doc.get("avatar_url", ""),
+        "bio": user_doc.get("bio", ""),
+        "verified": bool(user_doc.get("verified", False)),
+        "postCount": posts,
+        "followerCount": followers,
+        "followingCount": following,
+        "isFollowing": is_following,
+        "isSelf": viewer_id == uid,
+    }
+
+
+@api_router.get("/users/{user_id}")
+async def get_social_profile(user_id: str, viewer: Optional[dict] = Depends(get_optional_user)):
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=404, detail="Pengguna tidak ditemukan")
+    doc = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Pengguna tidak ditemukan")
+    return await _social_profile(doc, str(viewer["_id"]) if viewer else None)
+
+
+@api_router.get("/users/{user_id}/posts")
+async def get_user_posts(user_id: str, reels_only: bool = False,
+                         viewer: Optional[dict] = Depends(get_optional_user)):
+    query: dict = {"user_id": user_id}
+    if reels_only:
+        query["is_reel"] = True
+    docs = await db.posts.find(query).sort("created_at", -1).to_list(200)
+    return await _serialize_posts(docs, str(viewer["_id"]) if viewer else None)
+
+
+@api_router.get("/me/saved")
+async def get_saved_posts(current: dict = Depends(get_current_user)):
+    saves = await db.post_saves.find({"user_id": str(current["_id"])}).sort("created_at", -1).to_list(500)
+    ids = [ObjectId(s["post_id"]) for s in saves if ObjectId.is_valid(s["post_id"])]
+    if not ids:
+        return []
+    docs = await db.posts.find({"_id": {"$in": ids}}).to_list(500)
+    order = {str(s["post_id"]): i for i, s in enumerate(saves)}
+    docs.sort(key=lambda d: order.get(str(d["_id"]), 999))
+    return await _serialize_posts(docs, str(current["_id"]))
+
+
+# ---------------------------------------------------------------------------
+# Social search & reports
+# ---------------------------------------------------------------------------
+@api_router.get("/social/search")
+async def social_search(q: str, viewer: Optional[dict] = Depends(get_optional_user)):
+    term = (q or "").strip()
+    if not term:
+        return {"users": [], "posts": [], "restaurants": [], "hashtags": []}
+    rx = {"$regex": _re.escape(term.lstrip("#@")), "$options": "i"}
+    users = await db.users.find({"$or": [{"name": rx}, {"username": rx}]}).to_list(15)
+    user_out = [{
+        "id": str(u["_id"]), "name": u.get("name", ""), "username": u.get("username", ""),
+        "avatar": u.get("avatar_url", ""), "verified": bool(u.get("verified", False)),
+    } for u in users]
+    restos = await db.restaurants.find({"$or": [{"name": rx}, {"cuisine": rx}]}).to_list(15)
+    resto_out = [{"id": str(r["_id"]), "name": r.get("name", ""), "cuisine": r.get("cuisine", ""),
+                  "image": r.get("avatar_image", "")} for r in restos]
+    tag = term.lstrip("#").lower()
+    post_docs = await db.posts.find(
+        {"$or": [{"caption": rx}, {"hashtags": tag}]}).sort("created_at", -1).to_list(20)
+    posts = await _serialize_posts(post_docs, str(viewer["_id"]) if viewer else None)
+    hashtags: dict = {}
+    for p in post_docs:
+        for h in p.get("hashtags", []):
+            if tag in h:
+                hashtags[h] = hashtags.get(h, 0) + 1
+    hashtag_out = [{"tag": k, "count": v} for k, v in
+                   sorted(hashtags.items(), key=lambda x: -x[1])[:10]]
+    return {"users": user_out, "posts": posts, "restaurants": resto_out, "hashtags": hashtag_out}
+
+
+@api_router.post("/reports")
+async def create_report(body: ReportIn, current: dict = Depends(get_current_user)):
+    if body.target_type not in REPORT_TARGETS:
+        raise HTTPException(status_code=400, detail="Jenis laporan tidak valid")
+    if body.reason not in REPORT_REASONS:
+        raise HTTPException(status_code=400, detail="Alasan laporan tidak valid")
+    await db.reports.insert_one({
+        "reporter_id": str(current["_id"]),
+        "target_type": body.target_type,
+        "target_id": body.target_id,
+        "reason": body.reason,
+        "note": (body.note or "").strip()[:500],
+        "status": "open",
+        "created_at": _now().isoformat(),
+    })
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Social seed (dev data) — idempotent, only when posts collection is empty
+# ---------------------------------------------------------------------------
+SOCIAL_VIDEOS = [
+    "https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4",
+    "https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerMeltdowns.mp4",
+    "https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4",
+]
+
+
+async def seed_social():
+    if await db.posts.count_documents({}) > 0:
+        return
+    logger.info("Seeding Eatly social data (dev)...")
+
+    creators = [
+        {"email": "sari@eatly.com", "name": "Sari Wibowo", "username": "sarieats",
+         "avatar_url": "https://i.pravatar.cc/300?img=45", "verified": True,
+         "bio": "Food explorer Jakarta 🍜 | Kolektor tempat makan enak"},
+        {"email": "budi@eatly.com", "name": "Budi Hartono", "username": "bhfoodie",
+         "avatar_url": "https://i.pravatar.cc/300?img=12", "verified": False,
+         "bio": "Suka kulineran & kopi ☕"},
+        {"email": "maya@eatly.com", "name": "Maya Anggraini", "username": "mayaeats",
+         "avatar_url": "https://i.pravatar.cc/300?img=32", "verified": True,
+         "bio": "Dessert hunter 🍰 | Review jujur"},
+        {"email": "chef.rendra@eatly.com", "name": "Chef Rendra", "username": "chefrendra",
+         "avatar_url": "https://i.pravatar.cc/300?img=68", "verified": True,
+         "bio": "Chef & pemilik dapur. Behind the scenes tiap hari."},
+    ]
+    cid: dict = {}
+    for c in creators:
+        existing = await db.users.find_one({"email": c["email"]})
+        if existing:
+            await db.users.update_one({"_id": existing["_id"]},
+                                      {"$set": {"verified": c["verified"], "bio": c["bio"]}})
+            cid[c["username"]] = str(existing["_id"])
+            continue
+        doc = {**c, "referral_code": c["username"].upper()[:6] + "2026",
+               "total_orders": 0, "invited_friends": 0,
+               "password_hash": hash_password("password123"),
+               "created_at": _now().isoformat()}
+        res = await db.users.insert_one(doc)
+        cid[c["username"]] = str(res.inserted_id)
+
+    restos = await db.restaurants.find().to_list(50)
+    by_name = {r.get("name"): r for r in restos}
+
+    async def menu_for(resto_id: str, name_hint: str = ""):
+        items = await db.menu_items.find({"restaurant_id": resto_id}).to_list(50)
+        if not items:
+            return (None, None)
+        for it in items:
+            if name_hint.lower() in it.get("name", "").lower():
+                return (str(it["_id"]), it.get("name"))
+        return (str(items[0]["_id"]), items[0].get("name"))
+
+    warung = by_name.get("Warung Sinar Bahagia")
+    sushi = by_name.get("Sushi Tei Kemang")
+    laksa = by_name.get("Kedai Laksa Betawi")
+    kue = by_name.get("Toko Kue Nusantara")
+    ayam = by_name.get("Ayam Bakar Taliwang")
+    kopi = by_name.get("Kopi Senja")
+
+    def rid(r):
+        return str(r["_id"]) if r else None
+
+    posts = []
+    base = _now()
+
+    async def mk(creator, ptype, media, caption, resto=None, dish_hint="", location="Jakarta Selatan",
+                like=0, save=0, view=0, offset_min=0):
+        dish_id, dish_name = (None, None)
+        if resto and dish_hint:
+            dish_id, dish_name = await menu_for(rid(resto), dish_hint)
+        created = (base - timedelta(minutes=offset_min)).isoformat()
+        hashtags = list(dict.fromkeys(t.lower() for t in HASHTAG_RE.findall(caption)))
+        posts.append({
+            "user_id": cid[creator],
+            "author_name": next(c["name"] for c in creators if c["username"] == creator),
+            "author_username": creator,
+            "author_avatar": next(c["avatar_url"] for c in creators if c["username"] == creator),
+            "author_verified": next(c["verified"] for c in creators if c["username"] == creator),
+            "type": ptype,
+            "is_reel": ptype == "reel",
+            "media": media,
+            "caption": caption,
+            "hashtags": hashtags,
+            "mentions": [],
+            "restaurant_id": rid(resto),
+            "restaurant_name": resto.get("name") if resto else None,
+            "dish_id": dish_id,
+            "dish_name": dish_name,
+            "location": location,
+            "like_count": like, "comment_count": 0, "save_count": save, "view_count": view,
+            "created_at": created,
+        })
+
+    await mk("sarieats", "photo",
+             [{"type": "image", "url": IMG["rendang"], "poster": ""}],
+             "Rendang paling empuk di Kemang, bumbunya nampol banget 🔥 #rendang #kulinerjakarta #eatly",
+             warung, "Rendang", like=248, save=52, view=1200, offset_min=12)
+    await mk("chefrendra", "reel",
+             [{"type": "video", "url": SOCIAL_VIDEOS[0], "poster": IMG["nasi_goreng"]}],
+             "POV: nasi goreng spesial lagi diracik di wajan panas 🍳 #nasigoreng #streetfood #eatly",
+             warung, "Nasi Goreng", like=1820, save=340, view=24500, offset_min=30)
+    await mk("mayaeats", "carousel",
+             [{"type": "image", "url": IMG["cake"], "poster": ""},
+              {"type": "image", "url": IMG["cendol"], "poster": ""},
+              {"type": "image", "url": IMG["coffee"], "poster": ""}],
+             "Dessert tour di Toko Kue Nusantara! Swipe buat lihat semua 🍰 #dessert #manis #eatly",
+             kue, "Klappertaart", like=412, save=88, view=3100, offset_min=55)
+    await mk("bhfoodie", "photo",
+             [{"type": "image", "url": IMG["sushi"], "poster": ""}],
+             "Salmon sashimi-nya fresh banget, wajib cobain kalau ke sini 🍣 #sushi #japanesefood #eatly",
+             sushi, "Salmon", like=530, save=120, view=4200, offset_min=90)
+    await mk("sarieats", "reel",
+             [{"type": "video", "url": SOCIAL_VIDEOS[1], "poster": IMG["laksa"]}],
+             "Laksa Betawi legendaris, kuah santannya juara! Worth it? Definitely 🍜 #laksa #betawi #eatly",
+             laksa, "Laksa", like=2140, save=410, view=31200, offset_min=120)
+    await mk("mayaeats", "photo",
+             [{"type": "image", "url": IMG["ayam"], "poster": ""}],
+             "Ayam bakar Taliwang sambalnya pedas nampol 🌶️ cocok buat pecinta pedas #ayambakar #pedas #eatly",
+             ayam, "Ayam Bakar", like=298, save=61, view=2400, offset_min=180)
+    await mk("bhfoodie", "reel",
+             [{"type": "video", "url": SOCIAL_VIDEOS[2], "poster": IMG["coffee"]}],
+             "Kopi susu gula aren favorit sore-sore di Kopi Senja ☕ #kopi #coffee #eatly",
+             kopi, "Kopi Susu", like=980, save=210, view=15400, offset_min=240)
+    await mk("chefrendra", "carousel",
+             [{"type": "image", "url": IMG["interior"], "poster": ""},
+              {"type": "image", "url": IMG["sate"], "poster": ""},
+              {"type": "image", "url": IMG["gado"], "poster": ""}],
+             "Behind the scenes dapur kami hari ini 👨‍🍳 dari interior sampai plating #bts #dapur #eatly",
+             warung, "Sate", like=356, save=74, view=2800, offset_min=320)
+
+    res = await db.posts.insert_many(posts)
+    ids = res.inserted_ids
+
+    # A few real follow relationships between seed creators (dev data).
+    seed_follows = [
+        ("bhfoodie", "sarieats"), ("mayaeats", "sarieats"), ("bhfoodie", "chefrendra"),
+        ("sarieats", "chefrendra"), ("mayaeats", "chefrendra"), ("sarieats", "mayaeats"),
+    ]
+    for follower, following in seed_follows:
+        await db.follows.insert_one({"follower_id": cid[follower], "following_id": cid[following],
+                                     "created_at": _now().isoformat()})
+
+    # A couple of real seed comments so the UI isn't empty.
+    if ids:
+        top = await db.posts.find_one({"_id": ids[0]})
+        c1 = {"post_id": str(ids[0]), "parent_id": None, "user_id": cid["bhfoodie"],
+              "user_name": "Budi Hartono", "user_avatar": creators[1]["avatar_url"],
+              "text": "Ini sih favorit aku juga! 🔥", "like_count": 12, "reply_count": 1,
+              "created_at": (base - timedelta(minutes=8)).isoformat()}
+        r1 = await db.comments.insert_one(c1)
+        await db.comments.insert_one({"post_id": str(ids[0]), "parent_id": str(r1.inserted_id),
+              "user_id": cid["sarieats"], "user_name": "Sari Wibowo",
+              "user_avatar": creators[0]["avatar_url"], "text": "Setuju banget, coba yang extra pedas 🌶️",
+              "like_count": 3, "reply_count": 0, "created_at": (base - timedelta(minutes=5)).isoformat()})
+        await db.comments.insert_one({"post_id": str(ids[0]), "parent_id": None, "user_id": cid["mayaeats"],
+              "user_name": "Maya Anggraini", "user_avatar": creators[2]["avatar_url"],
+              "text": "Kepengen ke sini weekend ini 😍", "like_count": 5, "reply_count": 0,
+              "created_at": (base - timedelta(minutes=3)).isoformat()})
+        await db.posts.update_one({"_id": ids[0]}, {"$set": {"comment_count": 3}})
+    logger.info("Social seed complete.")
+
+
+
 
 app.include_router(api_router)
 
@@ -990,7 +1733,19 @@ async def on_startup():
     await db.orders.create_index("user_id")
     await db.notifications.create_index("user_id")
     await db.reviews.create_index("restaurant_id")
+    await db.posts.create_index([("created_at", -1)])
+    await db.posts.create_index("user_id")
+    await db.posts.create_index("is_reel")
+    await db.posts.create_index("hashtags")
+    await db.post_likes.create_index([("post_id", 1), ("user_id", 1)], unique=True)
+    await db.post_saves.create_index([("post_id", 1), ("user_id", 1)], unique=True)
+    await db.comments.create_index([("post_id", 1), ("parent_id", 1), ("created_at", -1)])
+    await db.comment_likes.create_index([("comment_id", 1), ("user_id", 1)], unique=True)
+    await db.follows.create_index([("follower_id", 1), ("following_id", 1)], unique=True)
+    await db.follows.create_index("following_id")
+    await db.reports.create_index("status")
     await seed_data()
+    await seed_social()
     asyncio.create_task(_order_progression_loop())
 
 

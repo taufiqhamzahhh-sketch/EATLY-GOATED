@@ -55,6 +55,11 @@ export default function RootLayout() {
                         <Stack.Screen name="order/[id]" />
                         <Stack.Screen name="review/[id]" />
                         <Stack.Screen name="notifications" />
+                        <Stack.Screen name="post/[id]" />
+                        <Stack.Screen name="user/[id]" />
+                        <Stack.Screen name="search" />
+                        <Stack.Screen name="saved" />
+                        <Stack.Screen name="create" options={{ presentation: "modal" }} />
                       </Stack>
                     </ToastProvider>
                   </OrdersProvider>

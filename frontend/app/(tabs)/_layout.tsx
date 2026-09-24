@@ -17,13 +17,17 @@ export default function TabsLayout() {
           <NativeTabs.Trigger.Icon sf="house.fill" />
           <NativeTabs.Trigger.Label>Beranda</NativeTabs.Trigger.Label>
         </NativeTabs.Trigger>
+        <NativeTabs.Trigger name="feed">
+          <NativeTabs.Trigger.Icon sf="square.stack.fill" />
+          <NativeTabs.Trigger.Label>Feed</NativeTabs.Trigger.Label>
+        </NativeTabs.Trigger>
+        <NativeTabs.Trigger name="reels">
+          <NativeTabs.Trigger.Icon sf="play.circle.fill" />
+          <NativeTabs.Trigger.Label>Reels</NativeTabs.Trigger.Label>
+        </NativeTabs.Trigger>
         <NativeTabs.Trigger name="pesanan">
           <NativeTabs.Trigger.Icon sf="list.bullet" />
           <NativeTabs.Trigger.Label>Pesanan</NativeTabs.Trigger.Label>
-        </NativeTabs.Trigger>
-        <NativeTabs.Trigger name="favorit">
-          <NativeTabs.Trigger.Icon sf="heart.fill" />
-          <NativeTabs.Trigger.Label>Favorit</NativeTabs.Trigger.Label>
         </NativeTabs.Trigger>
         <NativeTabs.Trigger name="profil">
           <NativeTabs.Trigger.Icon sf="person.fill" />
@@ -54,7 +58,25 @@ export default function TabsLayout() {
         options={{
           title: "Beranda",
           tabBarIcon: ({ color, focused }) => (
-            <Ionicons name={focused ? "navigate-circle" : "navigate-circle-outline"} size={26} color={color} />
+            <Ionicons name={focused ? "home" : "home-outline"} size={24} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="feed"
+        options={{
+          title: "Feed",
+          tabBarIcon: ({ color, focused }) => (
+            <Ionicons name={focused ? "albums" : "albums-outline"} size={24} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="reels"
+        options={{
+          title: "Reels",
+          tabBarIcon: ({ color, focused }) => (
+            <Ionicons name={focused ? "play-circle" : "play-circle-outline"} size={26} color={color} />
           ),
         }}
       />
@@ -63,16 +85,7 @@ export default function TabsLayout() {
         options={{
           title: "Pesanan",
           tabBarIcon: ({ color, focused }) => (
-            <Ionicons name={focused ? "receipt" : "receipt-outline"} size={24} color={color} />
-          ),
-        }}
-      />
-      <Tabs.Screen
-        name="favorit"
-        options={{
-          title: "Favorit",
-          tabBarIcon: ({ color, focused }) => (
-            <Ionicons name={focused ? "heart" : "heart-outline"} size={24} color={color} />
+            <Ionicons name={focused ? "receipt" : "receipt-outline"} size={23} color={color} />
           ),
         }}
       />
@@ -81,10 +94,12 @@ export default function TabsLayout() {
         options={{
           title: "Profil",
           tabBarIcon: ({ color, focused }) => (
-            <Ionicons name={focused ? "person" : "person-outline"} size={24} color={color} />
+            <Ionicons name={focused ? "person" : "person-outline"} size={23} color={color} />
           ),
         }}
       />
+      {/* Favorit remains a route but is reached from Profil / restaurant hearts */}
+      <Tabs.Screen name="favorit" options={{ href: null }} />
     </Tabs>
   );
 }
